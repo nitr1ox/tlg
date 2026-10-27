@@ -1,11 +1,13 @@
-import os, json, requests
+import os, requests
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from flask import Flask, request
 
 app = Flask(__name__)
 TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHAT_ID"]
 API_KEY = os.environ.get("SELLAUTH_API_KEY", "")
-DEBUG = os.environ.get("DEBUG", "1") == "1"
+TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Paris"))
 
 def send(text):
     requests.post(
@@ -14,12 +16,6 @@ def send(text):
         timeout=10,
     )
 
-def first(d, *keys, default="?"):
-    for k in keys:
-        if isinstance(d, dict) and d.get(k) not in (None, ""):
-            return d[k]
-    return default
-
 def fetch_invoice(shop_id, invoice_id):
     r = requests.get(
         f"https://api.sellauth.com/v1/shops/{shop_id}/invoices/{invoice_id}",
@@ -27,7 +23,33 @@ def fetch_invoice(shop_id, invoice_id):
         timeout=15,
     )
     r.raise_for_status()
-    return r.json()
+    j = r.json()
+    return j.get("data", j) if isinstance(j, dict) else {}
+
+def fmt_date(s):
+    if not s:
+        return "?"
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    return dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+def build(inv):
+    msg = (
+        "🛒 Nouvelle commande\n"
+        f"ID : {inv.get('id')}\n"
+        f"Email : {inv.get('email')}\n"
+        f"Montant : {inv.get('price')} {inv.get('currency')}\n"
+        f"Paiement : {inv.get('gateway')}\n"
+        f"Statut : {inv.get('status')}\n"
+        f"Date : {fmt_date(inv.get('created_at'))}\n"
+    )
+    for it in inv.get("items") or []:
+        p = it.get("product") or {}
+        v = it.get("variant") or {}
+        name = it.get("custom_name") or p.get("name") or "?"
+        if v.get("name"):
+            name += f" {v['name']}"
+        msg += f"• {name} x{it.get('quantity', 1)}\n"
+    return msg
 
 @app.get("/")
 def home():
@@ -38,32 +60,10 @@ def webhook():
     payload = request.get_json(silent=True) or {}
     shop_id = payload.get("shop_id")
     invoice_id = (payload.get("data") or {}).get("invoice_id")
-
     try:
-        inv = fetch_invoice(shop_id, invoice_id)
-        inv = inv.get("data", inv) if isinstance(inv, dict) else {}
+        send(build(fetch_invoice(shop_id, invoice_id)))
     except Exception as e:
-        send(f"⚠️ Commande #{invoice_id} reçue, mais erreur API : {e}")
-        return "ok", 200
-
-    msg = (
-        "🛒 Nouvelle commande\n"
-        f"ID : {first(inv, 'id', default=invoice_id)}\n"
-        f"Email : {first(inv, 'email')}\n"
-        f"Montant : {first(inv, 'price', 'total', 'amount')} {first(inv, 'currency', default='')}\n"
-        f"Paiement : {first(inv, 'gateway', 'payment_method')}\n"
-        f"Statut : {first(inv, 'status')}\n"
-        f"Date : {first(inv, 'created_at')}\n"
-    )
-    items = inv.get("items") or inv.get("products") or []
-    for it in items:
-        name = first(it, 'name') if first(it, 'name') != "?" else first(it.get('product', {}), 'name')
-        variant = first(it.get('variant', {}), 'name', default="")
-        msg += f"• {name} {variant} x{first(it, 'quantity', default=1)}\n"
-
-    send(msg)
-    if DEBUG:
-        send("DEBUG:\n" + json.dumps(inv, indent=1, ensure_ascii=False))
+        send(f"⚠️ Commande #{invoice_id} reçue, erreur : {e}")
     return "ok", 200
 
 if __name__ == "__main__":
